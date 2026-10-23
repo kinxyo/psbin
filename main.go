@@ -2,62 +2,60 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
+	"flag"
 	"fmt"
 	"html/template"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"time"
+	"strings"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/skip2/go-qrcode"
 )
 
 const maxPasteBytes = 1 << 20 // 1 MiB
 
-const schema = `
-CREATE TABLE IF NOT EXISTS pastes (
-	id         TEXT PRIMARY KEY,
-	content    TEXT NOT NULL,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)`
-
-type paste struct {
-	ID        string
-	Content   string
-	CreatedAt time.Time
+type server struct {
+	store Store
+	tmpl  *template.Template
 }
 
-type server struct {
-	db   *pgxpool.Pool
-	tmpl *template.Template
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func main() {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		dsn = "host=/run/postgresql dbname=textshare"
-	}
-	addr := os.Getenv("ADDR")
-	if addr == "" {
-		addr = ":8000"
+	addr := flag.String("addr", env("ADDR", ":8000"), "listen address, e.g. :8000 or 8000")
+	db := flag.String("db", os.Getenv("DATABASE_URL"), "Postgres connection string; if empty, pastes go to the -data file")
+	data := flag.String("data", "pastes.jsonl", "paste file, used when -db is empty")
+	flag.Parse()
+	if !strings.Contains(*addr, ":") {
+		*addr = ":" + *addr
 	}
 
-	ctx := context.Background()
-	db, err := pgxpool.New(ctx, dsn)
+	var store Store
+	var err error
+	if *db != "" {
+		store, err = openPG(context.Background(), *db)
+	} else {
+		store, err = openFile(*data)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer db.Close()
-	if _, err := db.Exec(ctx, schema); err != nil {
-		log.Fatal(err)
+	defer store.Close()
+	if *db != "" {
+		log.Printf("storing pastes in postgres")
+	} else {
+		log.Printf("storing pastes in %s", *data)
 	}
 
-	s := &server{db: db, tmpl: template.Must(template.New("").Parse(pages))}
+	s := &server{store: store, tmpl: template.Must(template.New("").Parse(pages))}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.index)
@@ -65,8 +63,8 @@ func main() {
 	mux.HandleFunc("GET /p/{id}", s.view)
 	mux.HandleFunc("GET /p/{id}/raw", s.raw)
 
-	printURL(addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	printURL(*addr)
+	log.Fatal(http.ListenAndServe(*addr, mux))
 }
 
 // printURL prints the LAN URL and a QR code for it, so a phone on the
@@ -94,20 +92,8 @@ func printURL(addr string) {
 	}
 }
 
-func newID() string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
 func (s *server) index(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(),
-		`SELECT id, left(content, 80), created_at FROM pastes ORDER BY created_at DESC LIMIT 20`)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	recent, err := pgx.CollectRows(rows, pgx.RowToStructByPos[paste])
+	recent, err := s.store.Recent(r.Context(), 20)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -122,9 +108,7 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty paste (or larger than 1 MiB)", http.StatusBadRequest)
 		return
 	}
-	id := newID()
-	_, err := s.db.Exec(r.Context(),
-		`INSERT INTO pastes (id, content) VALUES ($1, $2)`, id, content)
+	id, err := s.store.Create(r.Context(), content)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -133,11 +117,8 @@ func (s *server) create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) get(w http.ResponseWriter, r *http.Request) (paste, bool) {
-	var p paste
-	err := s.db.QueryRow(r.Context(),
-		`SELECT id, content, created_at FROM pastes WHERE id = $1`, r.PathValue("id")).
-		Scan(&p.ID, &p.Content, &p.CreatedAt)
-	if err == pgx.ErrNoRows {
+	p, err := s.store.Get(r.Context(), r.PathValue("id"))
+	if errors.Is(err, errNotFound) {
 		http.NotFound(w, r)
 		return p, false
 	}

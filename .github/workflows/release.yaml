@@ -1,0 +1,38 @@
+name: release
+
+# Every push to main builds the binaries and publishes them as a GitHub Release
+# tagged v0.1.<run number>. Other branches never trigger this.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir dist
+          for t in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${t%/*}; arch=${t#*/}
+            ext=''; [ "$os" = windows ] && ext='.exe'
+            GOOS=$os GOARCH=$arch go build -trimpath -ldflags='-s -w' -o "dist/psbin-$os-$arch$ext" .
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "v0.1.${{ github.run_number }}" dist/* --target "$GITHUB_SHA" --generate-notes
