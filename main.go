@@ -146,7 +146,7 @@ const pages = `
 {{define "head"}}<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>text-share</title>
+<title>psbin</title>
 <style>
 	body { font: 15px/1.5 monospace; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; }
 	textarea { width: 100%; height: 22rem; font: inherit; box-sizing: border-box; }
@@ -187,7 +187,7 @@ document.addEventListener('click', async e => {
 	setTimeout(() => b.textContent = label, 1200);
 });
 </script>
-<h1><a href="/" style="color:inherit;text-decoration:none">text-share</a></h1>
+<h1><a href="/" style="color:inherit;text-decoration:none">psbin</a></h1>
 {{end}}
 
 {{define "index"}}{{template "head"}}
