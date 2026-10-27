@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
@@ -29,9 +29,9 @@ type paste struct {
 }
 
 type Store interface {
-	Create(ctx context.Context, content string) (id string, err error)
+	Create(ctx context.Context, id, content string) error
 	Get(ctx context.Context, id string) (paste, error)
-	// Recent returns the newest pastes first, with Content cut to previewLen.
+	// Recent returns the newest pastes first, with their full Content.
 	Recent(ctx context.Context, n int) ([]paste, error)
 	Close()
 }
@@ -85,10 +85,9 @@ func openPG(ctx context.Context, dsn string) (*pgStore, error) {
 	return &pgStore{db: db}, nil
 }
 
-func (s *pgStore) Create(ctx context.Context, content string) (string, error) {
-	id := newID()
+func (s *pgStore) Create(ctx context.Context, id, content string) error {
 	_, err := s.db.Exec(ctx, `INSERT INTO pastes (id, content) VALUES ($1, $2)`, id, content)
-	return id, err
+	return err
 }
 
 func (s *pgStore) Get(ctx context.Context, id string) (paste, error) {
@@ -104,8 +103,7 @@ func (s *pgStore) Get(ctx context.Context, id string) (paste, error) {
 
 func (s *pgStore) Recent(ctx context.Context, n int) ([]paste, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, left(content, $1), created_at FROM pastes ORDER BY created_at DESC LIMIT $2`,
-		previewLen, n)
+		`SELECT id, content, created_at FROM pastes ORDER BY created_at DESC LIMIT $1`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -124,8 +122,14 @@ type fileStore struct {
 	byID   map[string]int
 }
 
-func openFile(path string) (*fileStore, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0o600)
+// openFile loads the paste file. readOnly never creates or writes to it, so
+// the CLI can read it while a server is appending.
+func openFile(path string, readOnly bool) (*fileStore, error) {
+	flags := os.O_RDWR | os.O_CREATE | os.O_APPEND
+	if readOnly {
+		flags = os.O_RDONLY
+	}
+	f, err := os.OpenFile(path, flags, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +141,7 @@ func openFile(path string) (*fileStore, error) {
 		if len(line) > 0 {
 			var p paste
 			if jerr := json.Unmarshal(line, &p); jerr != nil {
-				log.Printf("%s: skipping bad line: %v", path, jerr)
+				slog.Warn("skipping bad line", "path", path, "err", jerr)
 			} else {
 				s.byID[p.ID] = len(s.pastes)
 				s.pastes = append(s.pastes, p)
@@ -146,7 +150,7 @@ func openFile(path string) (*fileStore, error) {
 		if err == io.EOF {
 			// a crash mid-write leaves no trailing newline; add one so the
 			// next append doesn't glue onto the broken line
-			if len(line) > 0 {
+			if len(line) > 0 && !readOnly {
 				f.WriteString("\n")
 			}
 			break
@@ -159,21 +163,21 @@ func openFile(path string) (*fileStore, error) {
 	return s, nil
 }
 
-func (s *fileStore) Create(_ context.Context, content string) (string, error) {
-	p := paste{ID: newID(), Content: content, CreatedAt: time.Now()}
+func (s *fileStore) Create(_ context.Context, id, content string) error {
+	p := paste{ID: id, Content: content, CreatedAt: time.Now()}
 	line, err := json.Marshal(p)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, err := s.f.Write(append(line, '\n')); err != nil {
-		return "", err
+		return err
 	}
 	s.byID[p.ID] = len(s.pastes)
 	s.pastes = append(s.pastes, p)
-	return p.ID, nil
+	return nil
 }
 
 func (s *fileStore) Get(_ context.Context, id string) (paste, error) {
@@ -191,9 +195,7 @@ func (s *fileStore) Recent(_ context.Context, n int) ([]paste, error) {
 	defer s.mu.RUnlock()
 	var out []paste
 	for i := len(s.pastes) - 1; i >= 0 && len(out) < n; i-- {
-		p := s.pastes[i]
-		p.Content = preview(p.Content)
-		out = append(out, p)
+		out = append(out, s.pastes[i])
 	}
 	return out, nil
 }
